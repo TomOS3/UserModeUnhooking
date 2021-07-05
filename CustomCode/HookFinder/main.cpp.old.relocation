@@ -1,0 +1,355 @@
+#undef  _UNICODE
+#define _UNICODE
+#undef  UNICODE
+#define UNICODE
+
+using namespace std;
+#include <Windows.h>
+#include <stdio.h>
+#include "HookDetectorTM.h"
+#include <DbgHelp.h>
+#include "sysc_sw2.h"
+#include <map>
+#include <iostream>
+#include <vector>
+
+
+#pragma comment (lib, "Dbghelp.lib")
+
+#define SW2_SEED 0x874DD416
+#define SW2_ROL8(v) (v << 8 | v >> 24)
+#define SW2_ROR8(v) (v >> 8 | v << 24)
+#define SW2_ROX8(v) ((SW2_SEED % 2) ? SW2_ROL8(v) : SW2_ROR8(v))
+#define SW2_MAX_ENTRIES 3200 //BRS was 500
+#define SW2_RVA2VA(Type, DllBase, Rva) (Type)((ULONG_PTR) DllBase + Rva)
+
+//DWORD SW2_HashSyscall(PCSTR FunctionName);
+
+typedef struct _SW2_PEB_LDR_DATA {
+	BYTE Reserved1[8];
+	PVOID Reserved2[3];
+	LIST_ENTRY InMemoryOrderModuleList;
+} SW2_PEB_LDR_DATA, * PSW2_PEB_LDR_DATA;
+
+typedef struct _SW2_PEB {
+	BYTE Reserved1[2];
+	BYTE BeingDebugged;
+	BYTE Reserved2[1];
+	PVOID Reserved3[2];
+	PSW2_PEB_LDR_DATA Ldr;
+} SW2_PEB, * PSW2_PEB;
+
+typedef struct _SW2_LDR_DATA_TABLE_ENTRY {
+	PVOID Reserved1[2];
+	LIST_ENTRY InMemoryOrderLinks;
+	PVOID Reserved2[2];
+	PVOID DllBase;
+} SW2_LDR_DATA_TABLE_ENTRY, * PSW2_LDR_DATA_TABLE_ENTRY;
+
+typedef struct _SW2_SYSCALL_ENTRY
+{
+	DWORD Hash;
+	DWORD Address;
+} SW2_SYSCALL_ENTRY, * PSW2_SYSCALL_ENTRY;
+
+typedef struct _SW2_SYSCALL_LIST
+{
+	DWORD Count;
+	SW2_SYSCALL_ENTRY Entries[SW2_MAX_ENTRIES];
+} SW2_SYSCALL_LIST, * PSW2_SYSCALL_LIST;
+
+
+SW2_SYSCALL_LIST SW2_SyscallList;
+
+//DWORD SW2_HashSyscall(PCSTR FunctionName)
+//{
+//	DWORD i = 0;
+//	DWORD Hash = SW2_SEED;
+//
+//	while (FunctionName[i])
+//	{
+//		WORD PartialName = *(WORD*)((ULONG64)FunctionName + i++);
+//		Hash ^= PartialName + SW2_ROR8(Hash);
+//	}
+//
+//	return Hash;
+//}
+
+
+typedef struct FunctionEntry {
+	PCHAR name;
+	ULONG64 relativeAddress;
+};
+
+typedef std::map<PCHAR, vector<FunctionEntry>> DllFunctionMap;
+typedef std::map<PCHAR, ULONG64> DllBaseMap;
+
+DllFunctionMap dllFunctionMap;
+DllBaseMap dllBaseMap;
+
+//TODO: find ntdll using assembly: https://www.ired.team/offensive-security/code-injection-process-injection/finding-kernel32-base-and-function-addresses-in-shellcode
+
+int scanForHooks(int pid)
+{
+	//LPVOID lpProcAddress = GetProcAddress(LoadLibrary(L"user32.dll"), "towlower");
+	//printf("NTDLL.DLL adres voor method %p\n", lpProcAddress);
+
+
+
+	PSW2_PEB Peb = (PSW2_PEB)__readgsqword(0x60);
+	PSW2_PEB_LDR_DATA Ldr = Peb->Ldr;
+	PIMAGE_EXPORT_DIRECTORY ExportDirectory = NULL;
+	PVOID DllBase = NULL;
+
+	//BRS
+	PCHAR strDllName;
+	vector<FunctionEntry> functionEntryList;
+
+	// Get the DllBase address of NTDLL.dll. NTDLL is not guaranteed to be the second
+	// in the list, so it's safer to loop through the full list and find it.
+	PSW2_LDR_DATA_TABLE_ENTRY LdrEntry;
+	for (LdrEntry = (PSW2_LDR_DATA_TABLE_ENTRY)Ldr->Reserved2[1]; LdrEntry->DllBase != NULL; LdrEntry = (PSW2_LDR_DATA_TABLE_ENTRY)LdrEntry->Reserved1[0])
+	{
+		DllBase = LdrEntry->DllBase;
+		PIMAGE_DOS_HEADER DosHeader = (PIMAGE_DOS_HEADER)DllBase;
+		PIMAGE_NT_HEADERS NtHeaders = SW2_RVA2VA(PIMAGE_NT_HEADERS, DllBase, DosHeader->e_lfanew);
+		PIMAGE_DATA_DIRECTORY DataDirectory = (PIMAGE_DATA_DIRECTORY)NtHeaders->OptionalHeader.DataDirectory;
+		DWORD VirtualAddress = DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+		if (VirtualAddress == 0) continue;
+
+		ExportDirectory = (PIMAGE_EXPORT_DIRECTORY)SW2_RVA2VA(ULONG_PTR, DllBase, VirtualAddress);
+
+		// If this is NTDLL.dll, exit loop.
+		PCHAR DllName = SW2_RVA2VA(PCHAR, DllBase, ExportDirectory->Name);
+		
+		//BRS
+		//strDllName = (string)DllName;
+		strDllName = DllName;
+
+		printf("--------------------\n");
+		printf("DLL name: %s\n", DllName);
+		printf("DLL Base: %p\n", (ULONG64)DllBase);
+
+		if (!ExportDirectory) return FALSE;
+
+		DWORD NumberOfNames = ExportDirectory->NumberOfNames;
+		DWORD NumberOfFunctions = ExportDirectory->NumberOfFunctions;
+		printf("Should have %d names\n", NumberOfNames);
+		printf("Should have %d functions\n", NumberOfFunctions);
+		PDWORD Functions = SW2_RVA2VA(PDWORD, DllBase, ExportDirectory->AddressOfFunctions);
+		PDWORD Names = SW2_RVA2VA(PDWORD, DllBase, ExportDirectory->AddressOfNames);
+		PWORD Ordinals = SW2_RVA2VA(PWORD, DllBase, ExportDirectory->AddressOfNameOrdinals);
+
+		// Populate SW2_SyscallList with unsorted Zw* entries.
+		DWORD i = 0;
+		PSW2_SYSCALL_ENTRY Entries = SW2_SyscallList.Entries;
+		do
+		{
+			PCHAR FunctionName = SW2_RVA2VA(PCHAR, DllBase, Names[NumberOfNames - 1]);
+
+			//BRS
+			//printf("%s,", FunctionName);
+			struct FunctionEntry functionEntry;					
+			functionEntry.name = FunctionName;
+			functionEntry.relativeAddress = (ULONG64)Functions[Ordinals[NumberOfNames - 1]];
+			functionEntryList.push_back(functionEntry);
+		//	printf("%s,", functionEntry.name);
+
+			// Is this a system call?
+			//if (*(USHORT*)FunctionName == 'wZ')
+			{
+				//Entries[i].Hash = SW2_HashSyscall(FunctionName);
+				Entries[i].Address = Functions[Ordinals[NumberOfNames - 1]];
+
+				i++;
+				if (i == SW2_MAX_ENTRIES) break;
+			}
+		} while (--NumberOfNames);
+
+		//if ((*(ULONG*)DllName | 0x20202020) == 'ldtn')
+		//{
+			dllFunctionMap[strDllName] = functionEntryList;
+			dllBaseMap[strDllName] = (ULONG64)DllBase;
+		//}
+		// Save total number of system calls found.
+		printf("Methods found: %d\n", i);
+		SW2_SyscallList.Count = i;
+
+
+		//// Sort the list by address in ascending order.
+		//for (DWORD i = 0; i < SW2_SyscallList.Count - 1; i++)
+		//{
+		//	for (DWORD j = 0; j < SW2_SyscallList.Count - i - 1; j++)
+		//	{
+		//		if (Entries[j].Address > Entries[j + 1].Address)
+		//		{
+		//			// Swap entries.
+		//			SW2_SYSCALL_ENTRY TempEntry;
+
+		//			TempEntry.Hash = Entries[j].Hash;
+		//			TempEntry.Address = Entries[j].Address;
+
+		//			Entries[j].Hash = Entries[j + 1].Hash;
+		//			Entries[j].Address = Entries[j + 1].Address;
+
+		//			Entries[j + 1].Hash = TempEntry.Hash;
+		//			Entries[j + 1].Address = TempEntry.Address;
+		//		}
+		//	}
+		//}
+	}
+	return 0;
+}
+
+long GetFileSize(std::string filename)
+{
+	struct stat stat_buf;
+	int rc = stat(filename.c_str(), &stat_buf);
+	return rc == 0 ? stat_buf.st_size : -1;
+}
+
+std::wstring s2ws(const std::string& s)
+{
+	int len;
+	int slength = (int)s.length() + 1;
+	len = MultiByteToWideChar(CP_ACP, 0, s.c_str(), slength, 0, 0);
+	wchar_t* buf = new wchar_t[len];
+	MultiByteToWideChar(CP_ACP, 0, s.c_str(), slength, buf, len);
+	std::wstring r(buf);
+	delete[] buf;
+	return r;
+}
+
+#include <psapi.h>
+
+
+// Bovenstaande relatieve adressen werkt niet vanwege relocation: https://www.ired.team/offensive-security/defense-evasion/how-to-unhook-a-dll-using-c++
+
+int wmain(int argc, wchar_t* argv[]) {
+
+	if (argc != 2)
+	{
+		printf("Supply pid as argument. \n");
+		return -1;
+	}
+	int pid = _wtoi(argv[1]);
+	int ret = scanForHooks(pid);
+
+
+	for (const auto& any : dllBaseMap) {
+		PCHAR dllName = any.first;
+		ULONG64 dllAddr = any.second;
+		printf("%s at base address %p\n", dllName, dllAddr);
+
+		//string clonedDllFileName = "dlls\\local_" + (std::string(dllName));
+
+	/*	BOOL fileExists = FALSE;
+		if (FILE* file = fopen(clonedDllFileName.c_str(), "r")) {
+			fclose(file);
+			fileExists = TRUE;
+		}*/
+
+		//std::wstring stemp = s2ws((std::string(clonedDllFileName)));
+		//LPCWSTR baselineDllName = stemp.c_str();
+
+
+		std::wstring stemp2 = s2ws((std::string(std::string("c:\\windows\\system32\\" + std::string(dllName)))));
+		LPCWSTR normalDllName = stemp2.c_str();
+
+		HMODULE libraryHandle = LoadLibrary(normalDllName); //Laden originele .dll want kopie kan niet
+
+		//"c:\\windows\\system32\\ntdll.dll"
+		//MODULEINFO mi = {};
+		//HANDLE ntdllFile = CreateFile(normalDllName, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+
+			//LPVOID ntdllBase = (LPVOID)dllAddr;
+		   //HANDLE process = GetCurrentProcess();
+		   //HMODULE ntdllModule = GetModuleHandle(normalDllName);
+			//GetModuleInformation(process, ntdllModule, &mi, sizeof(mi));
+
+			//LPVOID ntdllBase = (LPVOID)mi.lpBaseOfDll;
+			//printf("DLL Base address: %p", ntdllBase);
+
+			//HANDLE ntdllMapping = CreateFileMapping(ntdllFile, NULL, PAGE_READONLY | SEC_IMAGE, 0, 0, NULL);
+//			if (ntdllMapping == 0)
+	//		{
+		//		printf("No unhooked clone of DLL available. Skipping analysis.\n");
+			//}
+			//else
+			//{
+				//LPVOID ntdllMappingAddress = MapViewOfFile(ntdllMapping, FILE_MAP_READ, 0, 0, 0);
+
+			//PIMAGE_DOS_HEADER hookedDosHeader = (PIMAGE_DOS_HEADER)ntdllBase;
+			//PIMAGE_NT_HEADERS hookedNtHeader = (PIMAGE_NT_HEADERS)((DWORD_PTR)ntdllBase + hookedDosHeader->e_lfanew);
+
+			//for (WORD i = 0; i < hookedNtHeader->FileHeader.NumberOfSections; i++) {
+//				PIMAGE_SECTION_HEADER hookedSectionHeader = (PIMAGE_SECTION_HEADER)((DWORD_PTR)IMAGE_FIRST_SECTION(hookedNtHeader) + ((DWORD_PTR)IMAGE_SIZEOF_SECTION_HEADER * i));
+
+				//if (!strcmp((char*)hookedSectionHeader->Name, (char*)".text")) {
+
+//					DWORD oldProtection = 0;
+	//				bool isProtected = VirtualProtect((LPVOID)((DWORD_PTR)ntdllBase + (DWORD_PTR)hookedSectionHeader->VirtualAddress), hookedSectionHeader->Misc.VirtualSize, PAGE_EXECUTE_READWRITE, &oldProtection);
+			//		memcpy((LPVOID)((DWORD_PTR)ntdllBase + (DWORD_PTR)hookedSectionHeader->VirtualAddress), (LPVOID)((DWORD_PTR)ntdllMappingAddress + (DWORD_PTR)hookedSectionHeader->VirtualAddress), hookedSectionHeader->Misc.VirtualSize);
+		//			isProtected = VirtualProtect((LPVOID)((DWORD_PTR)ntdllBase + (DWORD_PTR)hookedSectionHeader->VirtualAddress), hookedSectionHeader->Misc.VirtualSize, oldProtection, &oldProtection);
+
+		vector<FunctionEntry> functions = dllFunctionMap[dllName];
+		//memcpy((LPVOID)((DWORD_PTR)ntdllBase + (DWORD_PTR)hookedSectionHeader->VirtualAddress), (LPVOID)((DWORD_PTR)ntdllMappingAddress + (DWORD_PTR)hookedSectionHeader->VirtualAddress), hookedSectionHeader->Misc.VirtualSize);
+
+		for (FunctionEntry entry : functions)
+		{
+			printf("%s [%p]", entry.name, entry.relativeAddress);
+
+			BYTE functionCodeTarget[14];
+			BYTE functionCodeDisk[14];
+			//memcpy(&functionCodeDisk, (LPVOID)((DWORD_PTR)ntdllMappingAddress + (DWORD_PTR)hookedSectionHeader->VirtualAddress+ (DWORD_PTR)entry.relativeAddress), 14);
+			LPVOID totAddr = (LPVOID)(dllAddr + entry.relativeAddress);
+
+			LPVOID lpProcAddress = GetProcAddress(libraryHandle, (LPCSTR)entry.name);
+			if (lpProcAddress == 0)
+			{
+				printf("No address found, skipping!");
+			}
+			else
+			{
+
+				printf("Echte voor method %p\n", lpProcAddress);
+
+				memcpy(&functionCodeDisk, lpProcAddress, 14);
+				printf("Disk: ");
+				for (int i = 0; i < 14; i++)
+					printf(" %02X", functionCodeDisk[i]);
+
+			}
+
+			//}
+		//}
+		
+	
+
+			
+			//long dllFileSize = GetFileSize("dlls\\local_ntdll.dll");
+			//printf("DLL File Size: %ld", dllFileSize);
+
+			printf("Loaded unhooked clone of DLL.\n");
+			printf("Comparing content with original DLL.\n");
+
+			FreeLibrary(libraryHandle); 
+		}
+		
+		//TODO: vergelijken methodes 14 bytes?
+
+		
+		//HMODULE libraryHandle = LoadLibrary(L"C:\\RP2\\ntdll2.dll");
+		//LoadLibrary(L"C:\\RP2\\ntdll2.dll");
+
+
+
+
+
+	}
+
+	printf("\n");
+	printf("Press Any Key to Continue\n");
+	getchar();
+	return ret;
+}
