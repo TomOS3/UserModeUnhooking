@@ -1,5 +1,5 @@
 # User Mode Unhooking test script
-This project is created for research into antivirus evasion by unhooking. The paper containing additional information and references can be found here: (reference to paper). The repo contains scripts and source code for running unhooking techniques on different payloads to test the resilience of an antivirus product to such unhooking techniques. 
+This project is created for research into antivirus evasion by unhooking. The paper containing additional information and references can be found here: https://rp.os3.nl/2020-2021/p68/report.pdf. The repo contains scripts and source code for running unhooking techniques on different payloads to test the resilience of an antivirus product to such unhooking techniques. 
 
 Two of the five implemented techniques are novell techniques that can be used if an antivirus product hooks different functions on different processes of the same user:
 - Interprocess Function Copying
